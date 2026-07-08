@@ -13,8 +13,6 @@ from gtts import gTTS
 # "ffmpeg". Just adding the folder to PATH isn't enough — we also need a
 # plain "ffmpeg.exe" copy sitting in that folder so Windows can find it.
 
-os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-
 # ---------- CONFIG ----------
 ASSISTANT_NAME = "Iris"
 
