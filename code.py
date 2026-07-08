@@ -1,6 +1,8 @@
 import os
 import json
-import whisper
+import importlib
+
+whisper = importlib.import_module("whisper")
 import gradio as gr
 import google.generativeai as genai
 from gtts import gTTS
