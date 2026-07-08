@@ -12,15 +12,6 @@ from gtts import gTTS
 # "ffmpeg-win64-v7.0.2.exe"), but Whisper hardcodes the literal command
 # "ffmpeg". Just adding the folder to PATH isn't enough — we also need a
 # plain "ffmpeg.exe" copy sitting in that folder so Windows can find it.
-import shutil
-import imageio_ffmpeg
-
-_real_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-_ffmpeg_dir = os.path.dirname(_real_ffmpeg)
-_plain_ffmpeg = os.path.join(_ffmpeg_dir, "ffmpeg.exe")
-
-if not os.path.exists(_plain_ffmpeg):
-    shutil.copy(_real_ffmpeg, _plain_ffmpeg)
 
 os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
 
