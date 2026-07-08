@@ -3,3 +3,4 @@ whisper
 gtts
 google-generativeai
 gradio
+imageio-ffmpeg
