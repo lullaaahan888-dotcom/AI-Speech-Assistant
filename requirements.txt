@@ -1,5 +1,6 @@
 streamlit
 openai-whisper
+torch
 gtts
 google-generativeai
 gradio
