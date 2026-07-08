@@ -1,29 +1,14 @@
+import io
 import os
-import json
-import importlib
+import tempfile
 
-whisper = importlib.import_module("whisper")
-import gradio as gr
+import streamlit as st
+import whisper
 import google.generativeai as genai
 from gtts import gTTS
 
-# ✅ Use the ffmpeg binary bundled with imageio-ffmpeg instead of requiring
-# a system-wide install + PATH edit (run: pip install imageio-ffmpeg)
-#
-# NOTE: imageio_ffmpeg downloads a *versioned* exe name (e.g.
-# "ffmpeg-win64-v7.0.2.exe"), but Whisper hardcodes the literal command
-# "ffmpeg". Just adding the folder to PATH isn't enough — we also need a
-# plain "ffmpeg.exe" copy sitting in that folder so Windows can find it.
-
 # ---------- CONFIG ----------
 ASSISTANT_NAME = "Iris"
-
-# ❗ REPLACE WITH REAL KEY — must start with "AIza", get one at
-# https://aistudio.google.com/apikey
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
-MEMORY_FILE = "iris_memory.json"
-REPLY_AUDIO_PATH = "reply.mp3"
 
 # gTTS language codes it supports; fall back to English if Whisper
 # detects something gTTS doesn't have.
@@ -32,52 +17,64 @@ SUPPORTED_TTS_LANGS = {
     "ru", "ar", "nl", "tr", "pl", "sv", "id", "th", "vi",
 }
 
-# ---------- SPEECH TO TEXT ----------
-print("Loading Whisper model (this happens once, may take a minute)...")
-stt_model = whisper.load_model("small")
-
-def transcribe(audio_path):
-    if audio_path is None:
-        return "", "en"
-    result = stt_model.transcribe(audio_path, fp16=False)
-    return result["text"].strip(), result.get("language", "en")
-
-# ---------- MEMORY ----------
-def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"[memory] failed to load, starting fresh: {e}")
-            return {"facts": [], "conversation": []}
-    return {"facts": [], "conversation": []}
-
-def save_memory(mem):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(mem, f, indent=2)
-
-memory = load_memory()
-
-# ---------- LLM SETUP ----------
-genai.configure(api_key=GOOGLE_API_KEY)
-
 PERSONA = f"""You are {ASSISTANT_NAME}, a warm, quick-witted voice assistant.
 Always reply in the same language the user just spoke or typed in.
 Keep replies short and natural.
 Never make up facts about the user.
 """
 
-# ✅ Current, supported model name.
-# gemini-pro and the entire gemini-1.5 line have been shut down.
-# "gemini-flash-latest" always points to the newest Flash model if you'd
-# rather not update this string every time Google retires one.
-model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    system_instruction=PERSONA,
-)
+st.set_page_config(page_title=ASSISTANT_NAME, page_icon="🤖")
 
-chat = model.start_chat()
+# ---------- CACHED RESOURCES (loaded once per server, not per user) ----------
+@st.cache_resource(show_spinner="Loading speech-to-text model...")
+def load_whisper():
+    # "base" keeps memory use reasonable on Streamlit Community Cloud's
+    # free tier. Bump to "small" or "medium" if you're on a paid plan
+    # with more RAM.
+    return whisper.load_model("base")
+
+
+@st.cache_resource(show_spinner="Connecting to Gemini...")
+def load_model():
+    api_key = st.secrets.get("GOOGLE_API_KEY")
+    if not api_key:
+        st.error(
+            "No GOOGLE_API_KEY found in Streamlit secrets. "
+            "Add it under App settings → Secrets."
+        )
+        st.stop()
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        system_instruction=PERSONA,
+    )
+
+
+stt_model = load_whisper()
+model = load_model()
+
+# ---------- SESSION STATE ----------
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # [{role, content, audio?}]
+if "facts" not in st.session_state:
+    st.session_state.facts = []
+if "chat" not in st.session_state:
+    st.session_state.chat = model.start_chat()
+if "last_audio_id" not in st.session_state:
+    st.session_state.last_audio_id = None
+
+
+# ---------- SPEECH TO TEXT ----------
+def transcribe(audio_bytes):
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(audio_bytes)
+        path = f.name
+    try:
+        result = stt_model.transcribe(path, fp16=False)
+        return result["text"].strip(), result.get("language", "en")
+    finally:
+        os.remove(path)
+
 
 # ---------- SAFE FACT EXTRACTION ----------
 def extract_and_save_fact(user_text):
@@ -88,121 +85,90 @@ def extract_and_save_fact(user_text):
             f"Message: {user_text}"
         )
         response = model.generate_content(check_prompt)
-
         if not response or not hasattr(response, "text"):
             return
-
         fact = response.text.strip()
-
-        if fact != "NONE" and fact not in memory["facts"]:
-            memory["facts"].append(fact)
-            save_memory(memory)
-
+        if fact != "NONE" and fact not in st.session_state.facts:
+            st.session_state.facts.append(fact)
     except Exception as e:
         print(f"[fact extraction] error: {e}")
 
+
 # ---------- GENERATE REPLY ----------
 def generate_reply(user_text, lang_code="en"):
+    extract_and_save_fact(user_text)
+
     try:
-        extract_and_save_fact(user_text)
-
-        response = chat.send_message(user_text)
-
-        if not response or not hasattr(response, "text"):
-            reply_text = "Sorry, I couldn't respond."
-        else:
-            reply_text = response.text
-
-        memory["conversation"].append({
-            "user": user_text,
-            "assistant": reply_text
-        })
-        save_memory(memory)
-
-        # ✅ Use the language that was actually detected, with a safe fallback
-        tts_lang = lang_code if lang_code in SUPPORTED_TTS_LANGS else "en"
-        try:
-            tts = gTTS(text=reply_text, lang=tts_lang)
-            tts.save(REPLY_AUDIO_PATH)
-            audio_path = REPLY_AUDIO_PATH
-        except Exception as e:
-            print(f"[tts] error: {e}")
-            audio_path = None
-
-        return reply_text, audio_path
-
+        response = st.session_state.chat.send_message(user_text)
+        reply_text = response.text if hasattr(response, "text") else "Sorry, I couldn't respond."
     except Exception as e:
         print(f"[generate_reply] error: {e}")
-        return f"ERROR: {str(e)}", None
+        return f"ERROR: {e}", None
 
-# ---------- AVATAR ----------
-AVATAR_STATES = {
-    "idle": "🤖",
-    "listening": "👂",
-    "thinking": "🤔",
-    "speaking": "🗣️",
-}
+    tts_lang = lang_code if lang_code in SUPPORTED_TTS_LANGS else "en"
+    audio_bytes = None
+    try:
+        tts = gTTS(text=reply_text, lang=tts_lang)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        audio_bytes = buf.getvalue()
+    except Exception as e:
+        print(f"[tts] error: {e}")
 
-def avatar_html(state):
-    return f"<div style='font-size:100px;text-align:center'>{AVATAR_STATES.get(state, '🤖')}</div>"
+    return reply_text, audio_bytes
 
-# ---------- RESPONSE HANDLERS ----------
-def respond_from_audio(audio):
-    if audio is None:
-        yield "", "...", None, "\n".join(memory["facts"]), avatar_html("idle")
-        return
 
-    yield "...", "...", None, "\n".join(memory["facts"]), avatar_html("listening")
+# ---------- SIDEBAR ----------
+with st.sidebar:
+    st.subheader("🧠 Memory")
+    if st.session_state.facts:
+        for fact in st.session_state.facts:
+            st.write(f"- {fact}")
+    else:
+        st.caption("No facts saved yet.")
 
-    user_text, detected_lang = transcribe(audio)
+    if st.button("Clear conversation"):
+        st.session_state.messages = []
+        st.session_state.chat = model.start_chat()
+        st.rerun()
 
-    yield user_text, "...", None, "\n".join(memory["facts"]), avatar_html("thinking")
+# ---------- MAIN ----------
+st.title(f"{ASSISTANT_NAME} 🤖")
+st.caption("A voice assistant with memory — speak or type")
 
-    # ✅ Pass the detected language through instead of dropping it
-    reply_text, audio_path = generate_reply(user_text, detected_lang)
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+        if msg.get("audio"):
+            st.audio(msg["audio"], format="audio/mp3")
 
-    yield user_text, reply_text, audio_path, "\n".join(memory["facts"]), avatar_html("speaking")
+audio_value = st.audio_input("🎤 Record a message")
+text_value = st.chat_input("Or type here")
 
-def respond_from_text(user_text):
-    if not user_text.strip():
-        yield "", "...", None, "\n".join(memory["facts"]), avatar_html("idle")
-        return
+user_text, detected_lang = None, "en"
 
-    yield user_text, "...", None, "\n".join(memory["facts"]), avatar_html("thinking")
+if audio_value is not None:
+    audio_id = hash(audio_value.getvalue())
+    if audio_id != st.session_state.last_audio_id:
+        st.session_state.last_audio_id = audio_id
+        with st.spinner("Transcribing..."):
+            user_text, detected_lang = transcribe(audio_value.getvalue())
 
-    reply_text, audio_path = generate_reply(user_text)
+if text_value:
+    user_text, detected_lang = text_value, "en"
 
-    yield user_text, reply_text, audio_path, "\n".join(memory["facts"]), avatar_html("speaking")
+if user_text:
+    st.session_state.messages.append({"role": "user", "content": user_text})
+    with st.chat_message("user"):
+        st.write(user_text)
 
-# ---------- UI ----------
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo"), title=ASSISTANT_NAME) as demo:
-    gr.Markdown(f"# {ASSISTANT_NAME}")
-    gr.Markdown("A voice assistant with memory — speak or type")
+    with st.spinner("Thinking..."):
+        reply_text, audio_bytes = generate_reply(user_text, detected_lang)
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            avatar = gr.HTML(avatar_html("idle"))
-            memory_out = gr.Textbox(label="Memory", lines=6, interactive=False)
-
-        with gr.Column(scale=2):
-            with gr.Tab("🎤 Talk"):
-                mic = gr.Audio(sources=["microphone"], type="filepath")
-                mic_btn = gr.Button("Send")
-
-            with gr.Tab("⌨️ Type"):
-                text_in = gr.Textbox(label="Type here")
-                text_btn = gr.Button("Send")
-
-            user_out = gr.Textbox(label="You said")
-            reply_out = gr.Textbox(label="Iris replied")
-            audio_out = gr.Audio(autoplay=True)
-
-    outputs = [user_out, reply_out, audio_out, memory_out, avatar]
-
-    mic_btn.click(respond_from_audio, inputs=mic, outputs=outputs)
-    text_btn.click(respond_from_text, inputs=text_in, outputs=outputs)
-    text_in.submit(respond_from_text, inputs=text_in, outputs=outputs)
-
-# ---------- RUN ----------
-if __name__ == "__main__":
-    demo.launch(debug=True)
+    st.session_state.messages.append(
+        {"role": "assistant", "content": reply_text, "audio": audio_bytes}
+    )
+    with st.chat_message("assistant"):
+        st.write(reply_text)
+        if audio_bytes:
+            st.audio(audio_bytes, format="audio/mp3", autoplay=True)
