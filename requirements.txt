@@ -1,5 +1,5 @@
 streamlit
-openai-whisper
+openai-whisper==20231117
 torch
 gtts
 google-generativeai
