@@ -1,7 +1,5 @@
-streamlit
-openai-whisper==20231117
-torch
-gtts
+streamlit>=1.36
+openai-whisper
 google-generativeai
-gradio
-imageio-ffmpeg
+gtts
+torch
